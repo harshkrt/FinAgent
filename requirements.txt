@@ -1,0 +1,29 @@
+# Web Framework
+fastapi
+uvicorn[standard]
+
+# Database & ORM
+sqlalchemy
+psycopg2-binary # Driver for PostgreSQL
+
+# Vector & Graph DB Clients
+weaviate-client
+neo4j
+
+# S3 Client
+boto3
+
+# LLM & NLP
+langchain
+langgraph # For the agentic workflows
+ollama
+sentence-transformers
+# nougat-python
+
+# Message Broker
+pika
+
+# Utilities
+python-dotenv
+statsmodels # For forecasting
+scipy # For anomaly detection
