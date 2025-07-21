@@ -1,17 +1,17 @@
-version: '3.8'
-
 services:
   # 1. FastAPI Service
   api:
-    build: .
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     container_name: financial_api
-    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      - ./src:/app/src
+      - ./backend/src:/app/src
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - ./backend/.env
     depends_on:
       - postgres
       - weaviate
