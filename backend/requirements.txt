@@ -28,3 +28,5 @@ pika
 python-dotenv
 statsmodels # For forecasting
 scipy # For anomaly detection
+
+httpx
