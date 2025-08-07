@@ -11,7 +11,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      - .env
     depends_on:
       - postgres
       - weaviate
@@ -19,6 +19,23 @@ services:
       - ollama
       - rabbitmq
       - minio
+    networks:
+      - app_network
+
+  worker:
+    build:
+      context: ./backend
+    container_name: financial_worker
+    command: python -u worker.py
+    volumes:
+      - ./backend/src:/app
+      - nougat_cache:/root/.cache/torch 
+    env_file:
+      - .env
+    depends_on:
+      - rabbitmq
+      - minio
+      - ollama
     networks:
       - app_network
 
@@ -39,10 +56,11 @@ services:
 
   # 3. Weaviate Service (Vector DB)
   weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:latest
+    image: cr.weaviate.io/semitechnologies/weaviate:1.24.1
     container_name: weaviate_db
     ports:
       - "8080:8080"
+      - "50051:50051"
     volumes:
       - weaviate_data:/var/lib/weaviate
     environment:
@@ -112,6 +130,7 @@ services:
       - app_network
 
 volumes:
+  nougat_cache:
   postgres_data:
   weaviate_data:
   neo4j_data:

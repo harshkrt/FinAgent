@@ -3,24 +3,32 @@ import httpx
 import boto3
 import io 
 import os
+import re
 import pika
 import json
 import pika.spec
-from fastapi import UploadFile, HTTPException
+from fastapi import UploadFile, HTTPException, status
 from botocore.exceptions import ClientError
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+from core.config import settings
+
 
 load_dotenv()
+
+#T7.2 File url validation requirements
+MAX_FILE_SIZE_MB = 50
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+ALLOWED_MIME_TYPES = ["application/pdf", "text/html"]
 
 # ... source handler agent and methods ...
 class SourceHandlerAgent:
     def __init__(self):
         #initializes the agent and setup the minIO S3 client
-        self.minio_endpoint = "http://minio:9000"
-        self.minio_access_key = os.getenv("MINIO_ROOT_USER")
-        self.minio_secret_key = os.getenv("MINIO_ROOT_PASSWORD")
-        self.bucket_name = os.getenv("S3_BUCKET_NAME")
+        self.minio_endpoint = settings.MINIO_ENDPOINT_URL
+        self.minio_access_key = settings.MINIO_ROOT_USER
+        self.minio_secret_key = settings.MINIO_ROOT_PASSWORD
+        self.bucket_name = settings.S3_BUCKET_NAME
         
         if not all([self.minio_access_key, self.minio_secret_key, self.bucket_name]):
             raise ValueError("MINIO creds or bucket name ain't set in the .env file")
@@ -52,9 +60,9 @@ class SourceHandlerAgent:
             print(f"Uploading {file.filename} to MinIO bucket '{self.bucket_name}' as '{object_name}'")
             
             self.s3_client.upload_fileobj(
-                file.file,        # The file-like object from the UploadFile
-                self.bucket_name, # The target bucket
-                object_name       # The desired path/name within the bucket
+                file.file,        
+                self.bucket_name, 
+                object_name     
             )
             
             
@@ -69,49 +77,95 @@ class SourceHandlerAgent:
             return None
 
 
+    def validate_file(self, file: UploadFile):
+        """
+        Validates a direct file upload.
+        """
+        #Check MIME type (more reliable than filename extension)
+        if file.content_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail=f"Unsupported file type: {file.content_type}. Only PDF and HTML are allowed."
+            )
+            
+        file.file.seek(0, 2)
+        file_size = file.file.tell()
+        file.file.seek(0)
         
+        if file_size > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File is too large. Maximum size is {MAX_FILE_SIZE_MB} MB."
+            )
         
-    async def handle_url(self, url:str) -> str:
-        #fetches document from a url, validates it and uploads it to MinIO
-    
+        print(f"File validation successful for {file.filename}.")
+        
+    async def handle_url(self, url: str) -> str:
         try:
-            async with httpx.AsyncClient() as client:
-                response = client.get(url, follow_redirects=True, timeout=30.0)
-                response.raise_for_status()
+            # httpx to download content from the URL ===
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                print(f"[Fetcher] Received URL: {url}. Starting download.")
+                head_response = await client.get(url)
+                head_response.raise_for_status()
+                print("[Fetcher] Download successful.")
+
+                 # (Optional but good) Validate the content type
+                content_type = head_response.headers.get('content-type', '').lower()
+                if 'pdf' not in content_type and 'html' not in content_type:
+                    raise HTTPException(status_code=400, detail=f"Unsupported content type: {content_type}")
             
-            content_type = response.headers.get('content-type', '').lower()
-            if 'pdf' not in content_type and 'html' not in content_type:
-                raise HTTPException(status_code=400, detail=f"unsupported content type: {content_type}")
-        
-            content_bytes = await response.aread()
-            file_like_object = io.BytesIO(content_bytes)
-        
-            #extract file name from url
-            parsed_url = urlparse(url)
-            filename = os.path.basename(parsed_url.path)
-            if not filename:
-                filename = "downloaded_file.pdf" # fallback filename
+                content_length = int(head_response.headers.get('content-length', 0))
+                if content_length > MAX_FILE_SIZE_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File at URL is too large (> {MAX_FILE_SIZE_MB}MB).")
             
-            temp_upload_file = UploadFile(filename=filename, file=file_like_object)
-            s3_path = self.upload_file_to_storage(file=temp_upload_file)
-        
-            return s3_path
-    
+                filename = None
+                if 'content-disposition' in head_response.headers:
+                    # Use a regex to safely extract filename from the header
+                    # e.g., Content-Disposition: attachment; filename="example.pdf"
+                    cd_header = head_response.headers['content-disposition']
+                    matches = re.findall(r'filename="?([^"]+)"?', cd_header)
+                    if matches:
+                        filename = matches[0]
+                    
+                if not filename:
+                    final_url = str(head_response.url) # httpx gives the final URL after redirects
+                    filename = os.path.basename(urlparse(final_url).path) or "downloaded_file"
+                
+                #let's say if the filename is still empty
+                if not filename:
+                    filename = "downloaded_document.pdf"
+                
+                print(f"[Fetcher] Determined final filename to be: {filename}")
+            
+                # Perform GET request to download content (using the SAME client)
+                print(f"[Fetcher] Performing GET request to download content from: {head_response.url}")
+                get_response = await client.get(head_response.url) # Use the final URL
+                get_response.raise_for_status()
+                
+                content_bytes = await get_response.aread()
+                file_like_object = io.BytesIO(content_bytes)
+
+                temp_upload_file = UploadFile(filename=filename, file=file_like_object)
+                self.validate_file(temp_upload_file)
+
+                return self.upload_file_to_storage(file=temp_upload_file)
+
         except httpx.RequestError as e:
-            raise HTTPException(status_code=400, detail=f"failed to fetch file from the url: {e}")
+            # Handle download-specific errors
+            raise HTTPException(status_code=400, detail=f"Failed to fetch file from URL: {e}")
         except HTTPException as e:
-            raise e # re-raise from validation
-    
+            # Handle our own validation errors
+            raise e
         except Exception as e:
-            print(f"Unexpected error occured during URL handling: {e}")
-            raise HTTPException(status_code=400, detail="internal server error while handling URL.")
+            print(f"An unexpected error occurred during URL handling: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error while handling URL.")
 
     
     def publish_to_processing_queue(self, s3_path: str):
         #publish message to rabbitmq to trigger asynchronous processing pipeline
         try:
-            rabbitmq_user = os.getenv("RABBITMQ_USER")
-            rabbitmq_pass = os.getenv("RABBITMQ_PASS")
+            rabbitmq_user = settings.RABBITMQ_USER
+            rabbitmq_pass = settings.RABBITMQ_PASS
             credentials = pika.PlainCredentials(rabbitmq_user, rabbitmq_pass)
             
             #conntect to RabbitMQ that we pulled from docker compose
