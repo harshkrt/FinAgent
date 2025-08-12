@@ -1,31 +1,33 @@
-# Environment variables
-**/.env
-
-
-# Python bytecode and caches
+# --- Python ---
+# Byte-compiled / optimized / C extensions
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Virtual environment
-venv/
+# Poetry / Virtual Environments
 .venv/
-env/
-.env/
+poetry.lock
 
-# IDE and OS specific files
-.idea/
+# --- Secrets ---
+# Environment variables - VERY IMPORTANT!
+.env
+backend/.env
+
+# --- IDEs / Editors ---
 .vscode/
-.DS_Store
+.idea/
 *.swp
 
-# Build artifacts
-build/
+# --- Docker ---
+# Ignore local overrides
+docker-compose.override.yml
+
+# --- Build artifacts ---
 dist/
+build/
 *.egg-info/
 
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
+# --- Operating System files ---
+.DS_Store
+Thumbs.db

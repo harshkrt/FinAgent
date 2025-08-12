@@ -1,142 +1,118 @@
-import boto3.session
-import httpx 
-import boto3
-import io 
+import logging
 import os
-import pika
 import json
-import pika.spec
-from fastapi import UploadFile, HTTPException
-from botocore.exceptions import ClientError
-from urllib.parse import urlparse
-from dotenv import load_dotenv
+from typing import TypedDict, Union
+from botocore.client import Config
+import boto3
+import httpx
+import pika
+from src.core.config import settings
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-# ... source handler agent and methods ...
-class SourceHandlerAgent:
-    def __init__(self):
-        #initializes the agent and setup the minIO S3 client
-        self.minio_endpoint = "http://minio:9000"
-        self.minio_access_key = os.getenv("MINIO_ROOT_USER")
-        self.minio_secret_key = os.getenv("MINIO_ROOT_PASSWORD")
-        self.bucket_name = os.getenv("S3_BUCKET_NAME")
+# The 'state' that gets passed between the nodes in this specific pipeline
+class IngestionState(TypedDict):
+    job_id: str
+    source_type: str
+    input_data: Union[str, bytes]
+    filename: str
+    temp_file_path: str
+    s3_path: str
+    error: str
+
+# NODE 1: Fetcher
+def fetcher_node(state: IngestionState) -> IngestionState:
+    job_id, source_type, input_data, filename = state["job_id"], state["source_type"], state["input_data"], state["filename"]
+    logger.info(f"[Node: Fetcher, Job: {job_id}] Starting fetch for {source_type}.")
+    
+    temp_dir = "/tmp/ingestion_files"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_file_path = os.path.join(temp_dir, f"{job_id}_{filename}")
+
+    try:
+        if source_type == "upload":
+            with open(temp_file_path, "wb") as buffer: buffer.write(input_data)
+        elif source_type == "url":
+            with httpx.stream("GET", input_data, follow_redirects=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(temp_file_path, "wb") as buffer:
+                    for chunk in r.iter_bytes(): buffer.write(chunk)
         
-        if not all([self.minio_access_key, self.minio_secret_key, self.bucket_name]):
-            raise ValueError("MINIO creds or bucket name ain't set in the .env file")
-        
-        self.s3_client = boto3.client(
-            's3',
-            endpoint_url = self.minio_endpoint,
-            aws_access_key_id=self.minio_access_key,
-            aws_secret_access_key=self.minio_secret_key,
-            config=boto3.session.Config(signature_version='s3v4')
+        logger.info(f"[Node: Fetcher, Job: {job_id}] Document saved to: {temp_file_path}")
+        state["temp_file_path"] = temp_file_path
+        state["error"] = None
+    except Exception as e:
+        state["error"] = f"Failed to fetch document. Error: {e}"
+        logger.error(f"[Node: Fetcher, Job: {job_id}] {state['error']}")
+    return state
+
+# NODE 2: Archiver (Final, Robust Version)
+def archiver_node(state: IngestionState) -> IngestionState:
+    if state.get("error"):
+        return state
+    job_id, temp_file_path, filename = state["job_id"], state["temp_file_path"], state["filename"]
+    logger.info(f"[Node: Archiver, Job: {job_id}] Archiving to MinIO.")
+    
+    try:
+        s3 = boto3.client(
+            "s3", 
+            endpoint_url=f"http://{settings.MINIO_HOST}",
+            aws_access_key_id=settings.MINIO_ROOT_USER, 
+            aws_secret_access_key=settings.MINIO_ROOT_PASSWORD,
+            config=Config(signature_version='s3v4')
         )
-        self.create_bucket_if_not_exists()
+        bucket = settings.S3_BUCKET_NAME
+        object_name = f"raw_filings/{job_id}/{filename}"
         
-    def create_bucket_if_not_exists(self):
-        #checks if the bucket exists and if not then create one
-        try:
-            self.s3_client.head_bucket(Bucket=self.bucket_name)
-            print(f"Bucket '{self.bucket_name}' already exists.")
-        except ClientError as e:
-            if e.response['Error']['Code'] == '404':
-                print(f"Bucket '{self.bucket_name}' does not exist. Creating it now.")
-                self.s3_client.create_bucket(Bucket=self.bucket_name)
-            else:
-                raise
+        try: 
+            s3.head_bucket(Bucket=bucket)
+        except Exception: 
+            logger.info(f"Bucket '{bucket}' not found. Creating it.")
+            s3.create_bucket(Bucket=bucket)
+            
+        s3.upload_file(temp_file_path, bucket, object_name)
         
-    def upload_file_to_storage(self, file:UploadFile, company_name: str = 'unknown', report_type: str = '10-k') -> str:
-        try:
-            object_name = f"raw_filings/{company_name.upper()}/{report_type.upper()}/{file.filename}"
-            print(f"Uploading {file.filename} to MinIO bucket '{self.bucket_name}' as '{object_name}'")
-            
-            self.s3_client.upload_fileobj(
-                file.file,        # The file-like object from the UploadFile
-                self.bucket_name, # The target bucket
-                object_name       # The desired path/name within the bucket
-            )
-            
-            
-            print("Upload successful.")
-            return object_name
-        
-        except ClientError as e:
-            print(f"ERROR: Failed to upload file to MinIO. {e}")
-            return None # Return None to indicate failure
-        except Exception as e:
-            print(f"An unexpected error occurred during file upload: {e}")
-            return None
+        state["s3_path"] = f"s3://{bucket}/{object_name}"
+        logger.info(f"[Node: Archiver, Job: {job_id}] File archived to: {state['s3_path']}")
+        state["error"] = None
+    except Exception as e:
+        state["error"] = f"Failed to archive file. Error: {e}"
+        logger.error(f"[Node: Archiver, Job: {job_id}] {state['error']}")
+    return state
 
 
-        
-        
-    async def handle_url(self, url:str) -> str:
-        #fetches document from a url, validates it and uploads it to MinIO
+# NODE 3: Trigger
+def trigger_node(state: IngestionState) -> IngestionState:
+    if state.get("error"):
+        return state
+    job_id, s3_path = state["job_id"], state["s3_path"]
+    logger.info(f"[Node: Trigger, Job: {job_id}] Publishing job to RabbitMQ.")
     
-        try:
-            async with httpx.AsyncClient() as client:
-                response = client.get(url, follow_redirects=True, timeout=30.0)
-                response.raise_for_status()
-            
-            content_type = response.headers.get('content-type', '').lower()
-            if 'pdf' not in content_type and 'html' not in content_type:
-                raise HTTPException(status_code=400, detail=f"unsupported content type: {content_type}")
-        
-            content_bytes = await response.aread()
-            file_like_object = io.BytesIO(content_bytes)
-        
-            #extract file name from url
-            parsed_url = urlparse(url)
-            filename = os.path.basename(parsed_url.path)
-            if not filename:
-                filename = "downloaded_file.pdf" # fallback filename
-            
-            temp_upload_file = UploadFile(filename=filename, file=file_like_object)
-            s3_path = self.upload_file_to_storage(file=temp_upload_file)
-        
-            return s3_path
-    
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=400, detail=f"failed to fetch file from the url: {e}")
-        except HTTPException as e:
-            raise e # re-raise from validation
-    
-        except Exception as e:
-            print(f"Unexpected error occured during URL handling: {e}")
-            raise HTTPException(status_code=400, detail="internal server error while handling URL.")
+    try:
+        creds = pika.PlainCredentials(settings.RABBITMQ_USER, settings.RABBITMQ_PASS)
+        conn = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq_broker', credentials=creds))
+        ch = conn.channel()
+        q_name = "document_processing_queue"
+        ch.queue_declare(queue=q_name, durable=True)
+        msg = {"job_id": job_id, "s3_path": s3_path}
+        ch.basic_publish(exchange='', routing_key=q_name, body=json.dumps(msg), properties=pika.BasicProperties(delivery_mode=2))
+        conn.close()
+        logger.info(f"[Node: Trigger, Job: {job_id}] Job successfully published.")
+        state["error"] = None
+    except Exception as e:
+        state["error"] = f"Failed to publish to RabbitMQ. Error: {e}"
+        logger.error(f"[Node: Trigger, Job: {job_id}] {state['error']}")
+    return state
 
-    
-    def publish_to_processing_queue(self, s3_path: str):
-        #publish message to rabbitmq to trigger asynchronous processing pipeline
-        try:
-            rabbitmq_user = os.getenv("RABBITMQ_USER")
-            rabbitmq_pass = os.getenv("RABBITMQ_PASS")
-            credentials = pika.PlainCredentials(rabbitmq_user, rabbitmq_pass)
-            
-            #conntect to RabbitMQ that we pulled from docker compose
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host='rabbitmq', credentials=credentials)
-            )
-            channel = connection.channel()
-            
-            # this logic can survice rabbitmq restart :)
-            queue_name = 'doc_processing_queue'
-            channel.queue_declare(queue=queue_name, durable=True)
-            
-            message_body = json.dumps({"s3_path": s3_path})
-            
-            channel.basic_publish(
-                exchange='',
-                routing_key=queue_name,
-                body=message_body,
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE # making it persistent
-                )
-            )
-            
-            print(f"[x] sent message to queue '{queue_name}': {message_body}")
-            connection.close()
-            
-        except Exception as e:
-            print(f"ERROR: failed to publish message to RabbitMQ. {e}")
+# NODE 4: Cleanup
+def cleanup_node(state: IngestionState) -> IngestionState:
+    if not state.get("temp_file_path"):
+        return state
+    job_id, temp_file_path = state["job_id"], state["temp_file_path"]
+    logger.info(f"[Node: Cleanup, Job: {job_id}] Deleting temp file.")
+    try:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+    except Exception as e:
+        logger.warning(f"[Node: Cleanup, Job: {job_id}] Failed to delete temp file: {e}")
+    return state

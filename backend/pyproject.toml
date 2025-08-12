@@ -1,0 +1,54 @@
+[tool.poetry]
+name = "finagent"
+version = "0.1.0"
+description = "AI agent system for financial document analysis"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+# ===================================================================
+# ==                 CORE PRODUCTION DEPENDENCIES                  ==
+# == These will be installed in your final production Docker image. ==
+# ===================================================================
+[tool.poetry.dependencies]
+python = "^3.11"
+
+# --- Core Application Framework ---
+fastapi = "^0.111.0"                   # The web framework for building your API.
+uvicorn = {extras = ["standard"], version = "^0.29.0"} # The server that runs FastAPI.
+gunicorn = "^22.0.0"                  # A battle-tested production web server to manage Uvicorn.
+
+# --- AI & Agent Orchestration ---
+langchain = "^0.2.0"                  # The core framework for chaining agents and LLMs.
+langgraph = "^0.0.56"                 # The library for building your agent pipelines as graphs.
+langchain-community = "^0.2.0"        # Provides integrations for community tools like Ollama.
+sentence-transformers = "^2.7.0"      # For creating vector embeddings from text (Vectorizer Agent).
+
+# --- Data & Databases ---
+sqlalchemy = "^2.0.30"                # The ORM for communicating with your SQL database.
+psycopg2-binary = "^2.9.9"            # The specific driver Python needs to talk to PostgreSQL.
+weaviate-client = "^4.6.1"            # The official client for talking to your Weaviate vector DB.
+neo4j = "^5.20.0"                     # The official driver for talking to your Neo4j graph DB.
+boto3 = "^1.34.108"                   # The AWS SDK for Python, used to talk to MinIO (which mimics S3).
+pika = "^1.3.2"                       # The most common Python library for talking to RabbitMQ.
+
+# --- Document Parsing & Utilities ---
+PyMuPDF = "^1.24.4"                   # The best library for extracting text from PDF files (Parser Agent).
+trafilatura = "^1.9.0"                # Excellent for extracting main content from HTML files.
+httpx = "^0.27.0"                     # A modern HTTP client for making web requests (e.g., in your Fetcher Agent).
+pydantic-settings = "^2.2.1"          # The library that loads your .env file into your configuration.
+
+
+# ================================================================
+# ==                 DEVELOPMENT DEPENDENCIES                   ==
+# == These are only for testing and development. They will NOT  ==
+# == be installed in the final Docker image, saving space.      ==
+# ================================================================
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.1"                     # The industry standard for testing your Python code.
+pytest-asyncio = "^0.23.7"            # A pytest plugin needed to test your async FastAPI code.
+ruff = "^0.4.4"                       # An extremely fast linter and code formatter to keep your code clean.
+python-dotenv = "^1.0.1"              # Useful for loading .env files in local scripts outside of Docker.
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

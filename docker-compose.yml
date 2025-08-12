@@ -1,30 +1,43 @@
+version: '3.8'
+
 services:
-  # 1. FastAPI Service
+  # ==================================
+  # CORE SERVICES (Always On)
+  # ==================================
   api:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: financial_api
-    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - ./backend/src:/app/src
+    env_file:
+      - ./backend/.env
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app_network
+    # The CMD is now in the Dockerfile, making this cleaner.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: financial_worker
+    command: ["python", "src/worker.py"] # This command overrides the Dockerfile CMD
     env_file:
       - ./backend/.env
     depends_on:
-      - postgres
-      - weaviate
-      - neo4j
-      - ollama
-      - rabbitmq
-      - minio
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     networks:
       - app_network
-
-  # 2. PostgreSQL Service
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine # Use Alpine for a smaller image
     container_name: postgres_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -36,9 +49,81 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # 3. Weaviate Service (Vector DB)
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq_broker
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:7-alpine
+    container_name: redis_cache
+    ports:
+      - "6379:6379"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  minio:
+    image: minio/minio:latest
+    container_name: minio_storage
+    ports:
+      - "9000:9000"  # API Port
+      - "9001:9001"  # Console UI Port
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+
+  langgraph_studio:
+    image: langchain/langgraph-server:0.2.125-py3.13-wolfi
+    container_name: langgraph_studio
+    ports:
+      - "1984:1984"
+    environment:
+      LANGGRAPH_API_URL: http://api:8000
+      DATABASE_URI: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_db:5432/${POSTGRES_DB}"
+      REDIS_URI: "redis://redis_cache:6379"
+      LANGSMITH_API_KEY: "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"
+    depends_on:
+      - api
+    networks:
+      - app_network
+  # ==================================
+  # OPTIONAL PROFILES (Memory Heavy)
+  # ==================================
   weaviate:
+    profiles: ["db_heavy"] # Only starts with --profile db_heavy
     image: cr.weaviate.io/semitechnologies/weaviate:latest
     container_name: weaviate_db
     ports:
@@ -55,8 +140,8 @@ services:
     networks:
       - app_network
 
-  # 4. Neo4j Service (Knowledge Graph DB)
   neo4j:
+    profiles: ["db_heavy"] # Only starts with --profile db_heavy
     image: neo4j:5-community
     container_name: neo4j_db
     ports:
@@ -65,13 +150,16 @@ services:
     volumes:
       - neo4j_data:/data
     environment:
+      # Limit Neo4j memory usage
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_memory_heap_max__size: 1G
       NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
     networks:
       - app_network
 
-  # 5. Ollama Service
   ollama:
-    image: ollama/ollama:latest
+    profiles: ["llm"] # Only starts with --profile llm
+    image: ollama/ollama
     container_name: ollama_service
     ports:
       - "11434:11434"
@@ -79,37 +167,16 @@ services:
       - ollama_data:/root/.ollama
     networks:
       - app_network
-
-  # 6. RabbitMQ Service
-  rabbitmq:
-    image: rabbitmq:3.12-management
-    container_name: rabbitmq_broker
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+    deploy:
+      resources:
+        reservations:
+          devices: [] ## Empty means no enforced GPU requirement
+            # - driver: nvidia
+            #   count: 1
+            #   capabilities: [gpu]
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
-    networks:
-      - app_network
-
-  # 7. MinIO Service
-  minio:
-    image: minio/minio:latest
-    container_name: minio_storage
-    ports:
-      - "9000:9000"  # API Port
-      - "9001:9001"  # Console UI Port
-    volumes:
-      - minio_data:/data
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    command: server /data --console-address ":9001"
-    networks:
-      - app_network
+    # Optional: Force CPU mode even if GPU exists
+      OLLAMA_USE_GPU: "false"
 
 volumes:
   postgres_data:
